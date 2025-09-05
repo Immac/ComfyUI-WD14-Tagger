@@ -13,6 +13,9 @@ from PIL import Image
 from server import PromptServer
 from aiohttp import web
 import folder_paths
+import threading
+import hashlib
+from typing import Any, Dict, Optional
 from .pysssss import get_ext_dir, get_comfy_dir, download_to_file, update_node_status, wait_for_async, get_extension_config, log
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "comfy"))
 
@@ -29,6 +32,86 @@ defaults = {
     "HF_ENDPOINT": "https://huggingface.co"
 }
 defaults.update(config.get("settings", {}))
+
+# Memory-only cache manager for WD14 tagger results
+class WD14CacheManager:
+    """Memory-only cache manager for WD14 tagger results."""
+    
+    _instance = None
+    _initialized = False
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(WD14CacheManager, cls).__new__(cls)
+        return cls._instance
+    
+    def __init__(self):
+        if not WD14CacheManager._initialized:
+            self._cache: Dict[str, str] = {}
+            self._lock = threading.Lock()
+            self._max_size = 1000  # Maximum number of cached results
+            WD14CacheManager._initialized = True
+            log("WD14 memory cache initialized", "INFO", True)
+    
+    def _create_cache_key(self, image_data: bytes, model: str, threshold: float, 
+                         character_threshold: float, exclude_tags: str, 
+                         replace_underscore: bool, trailing_comma: bool) -> str:
+        """Create a deterministic hash key from image data and parameters."""
+        # Create hash from image data
+        image_hash = hashlib.md5(image_data).hexdigest()
+        
+        # Create hash from parameters
+        params = (model, threshold, character_threshold, exclude_tags, 
+                 replace_underscore, trailing_comma)
+        param_hash = hashlib.md5(str(params).encode()).hexdigest()
+        
+        return f"{image_hash}_{param_hash}"
+    
+    def get(self, key: str) -> Optional[str]:
+        """Get cached result."""
+        with self._lock:
+            return self._cache.get(key)
+    
+    def set(self, key: str, value: str):
+        """Set cached result with LRU eviction."""
+        with self._lock:
+            # Simple LRU: if cache is full, remove oldest entries
+            if len(self._cache) >= self._max_size:
+                # Remove 20% of oldest entries
+                to_remove = list(self._cache.keys())[:max(1, self._max_size // 5)]
+                for k in to_remove:
+                    del self._cache[k]
+            
+            self._cache[key] = value
+    
+    def clear(self):
+        """Clear all cached results."""
+        with self._lock:
+            self._cache.clear()
+            log("WD14 cache cleared", "INFO", True)
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        with self._lock:
+            return {
+                "cache_size": len(self._cache),
+                "max_size": self._max_size,
+                "sample_keys": list(self._cache.keys())[:5]
+            }
+
+# Initialize singleton cache manager
+_wd14_cache = WD14CacheManager()
+
+def create_deterministic_hash(*args):
+    """Create a deterministic hash from multiple arguments of any type."""
+    hashable_args = []
+    for arg in args:
+        if isinstance(arg, (dict, list)):
+            hashable_args.append(str(sorted(arg.items()) if isinstance(arg, dict) else sorted(arg)))
+        else:
+            hashable_args.append(arg)
+    
+    return format(hash(tuple(hashable_args)) & 0xffffffffffffffff, '016x')
 
 if "wd14_tagger" in folder_paths.folder_names_and_paths:
     models_dir = folder_paths.get_folder_paths("wd14_tagger")[0]
@@ -48,6 +131,30 @@ def get_installed_models():
 
 
 async def tag(image, model_name, threshold=0.35, character_threshold=0.85, exclude_tags="", replace_underscore=True, trailing_comma=False, client_id=None, node=None):
+    # Convert image to bytes for caching
+    import io
+    if hasattr(image, 'tobytes'):
+        image_data = image.tobytes()
+    else:
+        # Convert PIL image to bytes
+        buffer = io.BytesIO()
+        image.save(buffer, format='PNG')
+        image_data = buffer.getvalue()
+    
+    # Create cache key
+    cache_key = _wd14_cache._create_cache_key(
+        image_data, model_name, threshold, character_threshold, 
+        exclude_tags, replace_underscore, trailing_comma
+    )
+    
+    # Check cache first
+    cached_result = _wd14_cache.get(cache_key)
+    if cached_result is not None:
+        log(f"WD14 cache HIT for key: {cache_key[:8]}...", "DEBUG", True)
+        return cached_result
+    
+    log(f"WD14 cache MISS for key: {cache_key[:8]}...", "DEBUG", True)
+    
     if model_name.endswith(".onnx"):
         model_name = model_name[0:-5]
     installed = list(get_installed_models())
@@ -103,6 +210,10 @@ async def tag(image, model_name, threshold=0.35, character_threshold=0.85, exclu
 
     res = ("" if trailing_comma else ", ").join((item[0].replace("(", "\\(").replace(")", "\\)") + (", " if trailing_comma else "") for item in all))
 
+    # Cache the result
+    _wd14_cache.set(cache_key, res)
+    log(f"WD14 cache STORED for key: {cache_key[:8]}...", "DEBUG", True)
+    
     print(res)
     return res
 
@@ -183,11 +294,20 @@ class WD14Tagger:
         }}
 
     RETURN_TYPES = ("STRING",)
-    OUTPUT_IS_LIST = (True,)
+    RETURN_NAMES = ("tags",)
     FUNCTION = "tag"
-    OUTPUT_NODE = True
+    OUTPUT_NODE = False  # Not an output node - won't force execution
 
     CATEGORY = "image"
+
+    @classmethod
+    def IS_CHANGED(cls, image, model, threshold, character_threshold, exclude_tags, replace_underscore, trailing_comma):
+        # Return a hash of all inputs so ComfyUI knows when to re-run the node
+        return create_deterministic_hash(
+            image.tobytes() if hasattr(image, 'tobytes') else str(image),
+            model, threshold, character_threshold, exclude_tags, 
+            replace_underscore, trailing_comma
+        )
 
     def tag(self, image, model, threshold, character_threshold, exclude_tags="", replace_underscore=False, trailing_comma=False):
         tensor = image*255
@@ -196,15 +316,58 @@ class WD14Tagger:
         pbar = comfy.utils.ProgressBar(tensor.shape[0])
         tags = []
         for i in range(tensor.shape[0]):
-            image = Image.fromarray(tensor[i])
-            tags.append(wait_for_async(lambda: tag(image, model, threshold, character_threshold, exclude_tags, replace_underscore, trailing_comma)))
+            image_pil = Image.fromarray(tensor[i])
+            tag_result = wait_for_async(lambda: tag(image_pil, model, threshold, character_threshold, exclude_tags, replace_underscore, trailing_comma))
+            tags.append(tag_result)
             pbar.update(1)
-        return {"ui": {"tags": tags}, "result": (tags,)}
+        
+        # Join all tags with newlines for multiple images, or return single result
+        if len(tags) == 1:
+            result = tags[0]
+        else:
+            result = "\n".join(tags)
+        
+        log(f"WD14Tagger processed {len(tags)} images, results cached and returned", "INFO", True)
+        return (result,)
+
+
+class WD14CacheManager:
+    """Node for managing the WD14 cache system."""
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "action": (["get_stats", "clear_cache"], {"default": "get_stats"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("status",)
+    FUNCTION = "manage_cache"
+    CATEGORY = "image"
+
+    def manage_cache(self, action: str):
+        if action == "get_stats":
+            stats = _wd14_cache.get_stats()
+            status = f"WD14 Cache Stats:\n" \
+                    f"Memory entries: {stats['cache_size']}\n" \
+                    f"Max size: {stats['max_size']}\n" \
+                    f"Sample keys: {stats['sample_keys']}"
+            return (status,)
+        
+        elif action == "clear_cache":
+            _wd14_cache.clear()
+            return ("WD14 cache cleared successfully",)
+        
+        return ("Unknown action",)
 
 
 NODE_CLASS_MAPPINGS = {
     "WD14Tagger|pysssss": WD14Tagger,
+    "WD14CacheManager|pysssss": WD14CacheManager,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "WD14Tagger|pysssss": "WD14 Tagger 🐍",
+    "WD14Tagger|pysssss": "WD14 Tagger 🐍 (Cached)",
+    "WD14CacheManager|pysssss": "WD14 Cache Manager 🐍",
 }
