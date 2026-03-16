@@ -162,7 +162,50 @@ async def tag(image, model_name, threshold=0.35, character_threshold=0.85, exclu
         await download_model(model_name, client_id, node)
 
     name = os.path.join(models_dir, model_name + ".onnx")
-    model = InferenceSession(name, providers=defaults["ortProviders"])
+    
+    # Try to load model with configured providers (CUDA + CPU)
+    model = None
+    providers_attempted = defaults["ortProviders"]
+    
+    try:
+        log(f"Attempting to load WD14 model with providers: {providers_attempted}", "DEBUG", True)
+        model = InferenceSession(name, providers=providers_attempted)
+        log(f"WD14 model loaded successfully with providers: {model.get_providers()}", "INFO", True)
+    except Exception as cuda_error:
+        # CUDA/cuDNN initialization failed, log diagnostics and fall back to CPU
+        error_msg = str(cuda_error)
+        log(f"CUDA/cuDNN initialization failed: {error_msg}", "WARNING", True)
+        
+        # Provide diagnostic information
+        log("=== WD14 Tagger CUDA/cuDNN Diagnostic Information ===", "WARNING", True)
+        log(f"Error Type: {type(cuda_error).__name__}", "WARNING", True)
+        log(f"Available ORT providers on system: {ort.get_available_providers()}", "INFO", True)
+        
+        # Check if it's a cuDNN-related error
+        if "cudnn" in error_msg.lower() or "libcudnn" in error_msg.lower():
+            log("Detected: cuDNN library not found or incompatible", "WARNING", True)
+            log("RECOVERY STEPS:", "WARNING", True)
+            log("1. Verify cuDNN installation: python -c \"import onnxruntime as ort; print(ort.get_available_providers())\"", "WARNING", True)
+            log("2. Install cuDNN: conda install -c conda-forge cudnn", "WARNING", True)
+            log("3. For CUDA 13.0+, ensure cuDNN 9.x is installed", "WARNING", True)
+        elif "cuda" in error_msg.lower():
+            log("Detected: CUDA-related initialization error", "WARNING", True)
+            log("RECOVERY STEPS:", "WARNING", True)
+            log("1. Verify CUDA is properly installed and compatible with your PyTorch/ONNX Runtime", "WARNING", True)
+            log("2. Check CUDA version matches your environment", "WARNING", True)
+        
+        log("Falling back to CPU execution (will be slower)", "WARNING", True)
+        log("============================================", "WARNING", True)
+        
+        # Retry with CPU provider only
+        try:
+            log("Attempting fallback to CPU-only execution...", "INFO", True)
+            model = InferenceSession(name, providers=["CPUExecutionProvider"])
+            log(f"WD14 model loaded successfully with fallback provider: {model.get_providers()}", "INFO", True)
+        except Exception as cpu_error:
+            # Even CPU fallback failed - this is a critical error
+            log(f"CRITICAL: CPU fallback also failed. Model file may be corrupted. Error: {str(cpu_error)}", "ERROR", True)
+            raise RuntimeError(f"Failed to load WD14 model with both CUDA and CPU providers. Last error: {str(cpu_error)}")
 
     input = model.get_inputs()[0]
     height = input.shape[1]
