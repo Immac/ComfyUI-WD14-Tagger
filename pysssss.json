@@ -2,7 +2,7 @@
 	"name": "WD14Tagger",
 	"logging": false,
 	"settings": {
-		"model": "wd-v1-4-moat-tagger-v2",
+		"model": "wd-vit-large-tagger-v3",
 		"threshold": 0.35,
 		"character_threshold": 0.85,
 		"exclude_tags": "",
@@ -10,6 +10,7 @@
 		"HF_ENDPOINT": "https://huggingface.co"
 	},
 	"models": {
+		"wd-vit-large-tagger-v3": "{HF_ENDPOINT}/SmilingWolf/wd-vit-large-tagger-v3",
 		"wd-eva02-large-tagger-v3": "{HF_ENDPOINT}/SmilingWolf/wd-eva02-large-tagger-v3",
 		"wd-vit-tagger-v3": "{HF_ENDPOINT}/SmilingWolf/wd-vit-tagger-v3",
 		"wd-swinv2-tagger-v3": "{HF_ENDPOINT}/SmilingWolf/wd-swinv2-tagger-v3",
